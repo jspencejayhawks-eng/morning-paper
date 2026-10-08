@@ -1,0 +1,59 @@
+name: Morning Paper
+
+on:
+  schedule:
+    - cron: "17 10 * * *"   # GitHub runs on UTC: 5:17 a.m. Central in summer, 4:17 a.m. in winter
+  workflow_dispatch:         # adds a "Run workflow" button for testing
+
+permissions:
+  contents: write
+
+concurrency:
+  group: morning-paper
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v7
+
+      - name: Get past episodes
+        uses: actions/checkout@v7
+        continue-on-error: true   # the very first run has no episodes yet
+        with:
+          ref: gh-pages
+          path: site
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Reuse the voice model
+        uses: actions/cache@v6
+        with:
+          path: models
+          key: kokoro-v1.0
+
+      - name: Install tools
+        run: pip install kokoro-onnx==0.6.1 feedparser==6.0.14 astral==3.2 lameenc==1.8.4 pillow==12.1.1
+
+      - name: Make today's episode
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python paper.py
+
+      - name: Publish
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          cd site
+          rm -rf .git
+          git init -q -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Episode for $(TZ=America/Chicago date +%F)"
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
