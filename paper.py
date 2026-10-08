@@ -31,6 +31,7 @@ TIMEZONE = "America/Chicago"      # your time zone; "America/Los_Angeles" after 
 VOICE = "af_heart"                # male option: "am_michael"
 SPEED = 1.0                       # 1.1 reads a little faster
 KEEP_EPISODES = 7                 # older episodes get deleted
+EPISODE_WORDS = 1350              # length target; the voice reads about 150 words a minute
 GEMINI_MODELS = [                 # tried in order until one works on the free tier
     "gemini-flash-latest", "gemini-2.5-flash",
     "gemini-flash-lite-latest", "gemini-2.5-flash-lite",
@@ -66,7 +67,7 @@ SECTIONS = {
         ("ESPN", "https://www.espn.com/espn/rss/nfl/news"),
     ],
     "Jayhawks basketball": [
-        (None, gnews('"Kansas Jayhawks" basketball')),
+        (None, gnews('"Kansas Jayhawks" basketball -football')),
         ("Rock Chalk Talk", "https://www.rockchalktalk.com/rss/index.xml"),
     ],
     "Fantasy football": [
@@ -93,6 +94,11 @@ SECTIONS = {
     ],
 }
 
+# Headlines to drop from a section, matched against the title.
+SKIP_TITLES = {
+    "Jayhawks basketball": r"\bfootball\b",
+}
+
 # Names the voice gets wrong, respelled the way they should sound.
 SAY_AS = {
     "Mahomes": "Muh-homes",
@@ -104,6 +110,9 @@ SAY_AS = {
     "TD": "touchdown",
     "mph": "miles per hour",
 }
+
+MAX_WORDS = EPISODE_WORDS + 150    # about ten minutes
+SHORT_WORDS = EPISODE_WORDS - 250  # a draft shorter than this gets one rewrite
 
 HOST_BRIEF = f"""You write the script for {SHOW_TITLE}, a personal daily news podcast for one listener who usually hears it while driving. A text-to-speech voice reads your script word for word, so write only what should be said out loud.
 
@@ -118,7 +127,9 @@ Style
 
 Rules
 - Use only the weather data and news items provided. Never add facts, names, numbers, or details that aren't in them. If an item is only a headline, say only what the headline says.
-- Aim for up to ten minutes, about 1,300 to 1,600 words and no more: two to four stories per section, a sentence or two each, with a little more on the biggest stories. Pick the most important items and skip duplicates, listicles, reviews, and promotional pieces.
+- Length matters: write about {EPISODE_WORDS:,} words, which reads in about {round(EPISODE_WORDS / 150)} minutes, and never more than {MAX_WORDS:,}. Only come in shorter when the news itself is thin.
+- In each news section, cover three or four stories when there's enough news, in two or three sentences each, using the details in each item's summary. Give the biggest stories a little more. A full news section runs about 150 to 200 words, and each weather report about 50 to 70 words.
+- Pick the most important items and skip duplicates, listicles, reviews, and promotional pieces.
 - If a section has nothing worthwhile, give it one line or skip it.
 - Translate anything in Portuguese into natural English.
 - Open with a one-line greeting that includes the day and date. End with exactly: That's the paper.
@@ -127,7 +138,7 @@ Lineup, in this order
 1. Arkadelphia weather: today's high and low, rain chances, anything notable such as alerts, plus sunrise and sunset.
 2. Top headlines: the three to five biggest national and world stories.
 3. Chiefs and NFL: Chiefs first (latest game, injuries, what's next), then the biggest league news.
-4. Jayhawks basketball: in season, results and what's next. In the offseason, only real news like recruiting or roster moves.
+4. Jayhawks basketball: Kansas men's basketball only. Skip Kansas football and every other sport, even when those stories show up in the items. In season, results and what's next. In the offseason or preseason, only real news like rankings, recruiting, or roster moves.
 5. Fantasy football: injuries, role changes, and waiver pickups worth grabbing.
 6. Los Angeles weather: the same rundown as Arkadelphia.
 7. Hollywood and screenwriting: deals, spec and pitch sales, greenlights, staffing, and WGA news.
@@ -163,6 +174,16 @@ def strip_html(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def summary_of(entry):
+    """The fullest text the feed gives for an item, trimmed to a few sentences."""
+    texts = [strip_html(part.get("value")) for part in entry.get("content") or []]
+    texts.append(strip_html(entry.get("summary")))
+    text = max(texts, key=len)
+    if len(text) > 600:
+        text = text[:600].rsplit(" ", 1)[0] + "..."
+    return text
+
+
 def feed_items(source, url, cutoff):
     import feedparser
 
@@ -184,7 +205,7 @@ def feed_items(source, url, cutoff):
         items.append({
             "title": title,
             "source": outlet or "news reports",
-            "summary": strip_html(entry.get("summary"))[:280] if source else "",
+            "summary": summary_of(entry) if source else "",
             "when": when,
             "portuguese": "hl=pt-BR" in url,
         })
@@ -202,6 +223,7 @@ def gather(now):
             log(f"  {section}: {len(report[section]['weather'])} lines")
             continue
         items, seen = [], set()
+        skip = SKIP_TITLES.get(section)
         for source, url in spec:
             label = source or "Google News"
             try:
@@ -211,6 +233,8 @@ def gather(now):
                 continue
             log(f"  {section}: {len(found)} from {label}")
             for item in found:
+                if skip and re.search(skip, item["title"], re.I):
+                    continue
                 key = re.sub(r"\W+", " ", item["title"].lower()).strip()[:70]
                 if key not in seen:
                     seen.add(key)
@@ -314,48 +338,71 @@ def build_packet(now, report):
     return "\n".join(lines)
 
 
-def write_script(packet):
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not key:
-        log("No GEMINI_API_KEY secret found, so using the basic headline read.")
-        return None
+def ask_gemini(key, model, prompt):
+    """One request to one model. Returns the script text, or None if it didn't work."""
     body = json.dumps({
         "systemInstruction": {"parts": [{"text": HOST_BRIEF}]},
-        "contents": [{"role": "user", "parts": [{"text": packet}]}],
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.6},
         "safetySettings": [{"category": c, "threshold": "BLOCK_ONLY_HIGH"} for c in (
             "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
             "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")],
     }).encode()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    for attempt in (1, 2):
+        request = urllib.request.Request(url, data=body, headers={
+            "Content-Type": "application/json", "x-goog-api-key": key})
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                data = json.load(response)
+        except urllib.error.HTTPError as err:
+            detail = err.read().decode(errors="replace")[:200].replace("\n", " ")
+            log(f"  Gemini {model}: HTTP {err.code} {detail}")
+            if err.code in (500, 503) and attempt == 1:
+                time.sleep(20)
+                continue
+            return None
+        except Exception as err:
+            log(f"  Gemini {model}: {err}")
+            if attempt == 1:
+                time.sleep(10)
+                continue
+            return None
+        candidate = (data.get("candidates") or [{}])[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        if len(text.split()) >= 150:
+            return text
+        log(f"  Gemini {model}: unusable reply (finish reason {candidate.get('finishReason')})")
+        return None
+    return None
+
+
+def write_script(packet):
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        log("No GEMINI_API_KEY secret found, so using the basic headline read.")
+        return None
     for model in GEMINI_MODELS:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        for attempt in (1, 2):
-            request = urllib.request.Request(url, data=body, headers={
-                "Content-Type": "application/json", "x-goog-api-key": key})
-            try:
-                with urllib.request.urlopen(request, timeout=300) as response:
-                    data = json.load(response)
-            except urllib.error.HTTPError as err:
-                detail = err.read().decode(errors="replace")[:200].replace("\n", " ")
-                log(f"  Gemini {model}: HTTP {err.code} {detail}")
-                if err.code in (500, 503) and attempt == 1:
-                    time.sleep(20)
-                    continue
-                break
-            except Exception as err:
-                log(f"  Gemini {model}: {err}")
-                if attempt == 1:
-                    time.sleep(10)
-                    continue
-                break
-            candidate = (data.get("candidates") or [{}])[0]
-            parts = candidate.get("content", {}).get("parts", [])
-            text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-            if len(text.split()) >= 150:
-                log(f"Script written by {model}: {len(text.split())} words")
-                return text
-            log(f"  Gemini {model}: unusable reply (finish reason {candidate.get('finishReason')})")
-            break
+        text = ask_gemini(key, model, packet)
+        if not text:
+            continue
+        words = len(text.split())
+        log(f"Script written by {model}: {words} words")
+        if words < SHORT_WORDS:
+            log("  That runs short, so asking for a fuller version...")
+            fuller = ask_gemini(key, model, (
+                f"{packet}\n\n---\n\nHere is a draft script built from the items above. It's only "
+                f"{words} words, so it runs short. Rewrite it at about {EPISODE_WORDS:,} words by "
+                "covering more of the stories above and using more of the detail in their summaries. "
+                "Every rule still applies: only facts from the items, the same lineup and order, "
+                "and end with exactly: That's the paper.\n\nDRAFT\n" + text))
+            if fuller and words < len(fuller.split()) <= MAX_WORDS + 100:
+                text = fuller
+                log(f"  Fuller version: {len(text.split())} words")
+            else:
+                log("  Kept the first draft")
+        return text
     log("Gemini wasn't available, so using the basic headline read.")
     return None
 
