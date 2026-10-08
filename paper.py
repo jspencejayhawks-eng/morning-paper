@@ -3,14 +3,16 @@
 
 Every morning GitHub Actions runs this script. It pulls weather from the
 National Weather Service (Open-Meteo outside the US) and headlines from free
-news feeds, has Google's
-Gemini (free tier) write a radio-style script, reads it with Kokoro (a free,
-open-source voice), and updates the podcast feed that GitHub Pages serves.
+news feeds, has Google's Gemini (free tier) write a radio-style script, reads
+it aloud with Gemini's free text-to-speech voice (with Kokoro, a free
+open-source voice, as a backup), and updates the podcast feed that GitHub Pages
+serves.
 
 Everything you're likely to change is in SETTINGS below.
 """
 
 import argparse
+import base64
 import datetime as dt
 import email.utils
 import html
@@ -28,8 +30,11 @@ from zoneinfo import ZoneInfo
 # ─── SETTINGS ────────────────────────────────────────────────────────────────
 SHOW_TITLE = "The Morning Paper"
 TIMEZONE = "America/Chicago"      # your time zone; "America/Los_Angeles" after the move
-VOICE = "af_heart"                # male option: "am_michael"
-SPEED = 1.0                       # 1.1 reads a little faster
+VOICE = "Kore"                    # Gemini voice; "Charon" or "Puck" for a man's voice
+VOICE_STYLE = ("like a relaxed, confident morning radio host: warm, conversational, "
+               "natural pace, upbeat but not over the top")
+BACKUP_VOICE = "af_heart"         # free backup voice, used only if Gemini's voice is down
+SPEED = 1.0                       # backup voice speed; 1.1 reads a little faster
 KEEP_EPISODES = 7                 # older episodes get deleted
 EPISODE_WORDS = 1350              # length target; the voice reads about 150 words a minute
 GEMINI_MODELS = [                 # tried in order; newer Flash models get added automatically
@@ -138,7 +143,7 @@ Lineup, in this order
 1. Arkadelphia weather: today's high and low, rain chances, anything notable such as alerts, plus sunrise and sunset.
 2. Top headlines: the three to five biggest national and world stories.
 3. Chiefs and NFL: Chiefs first (latest game, injuries, what's next), then the biggest league news.
-4. Jayhawks basketball: Kansas men's basketball only. Skip Kansas football and every other sport, even when those stories show up in the items. In season, results and what's next. In the offseason or preseason, only real news like rankings, recruiting, or roster moves.
+4. Jayhawks basketball: Kansas men's basketball only. Skip other schools' basketball, Kansas football, and every other sport, even when those stories show up in the items. If there's no real Kansas basketball news, say so in one line. In season, results and what's next. In the offseason or preseason, only real news like rankings, recruiting, or roster moves.
 5. Fantasy football: injuries, role changes, and waiver pickups worth grabbing.
 6. Los Angeles weather: the same rundown as Arkadelphia.
 7. Hollywood and screenwriting: deals, spec and pitch sales, greenlights, staffing, and WGA news.
@@ -338,7 +343,8 @@ def build_packet(now, report):
     return "\n".join(lines)
 
 
-GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_API = f"{GEMINI_BASE}/models"
 BUSY_WAITS = (2, 5, 10)           # minutes to wait before trying again when Gemini is busy
 GEMINI_DEADLINE = 25 * 60         # seconds to keep trying before falling back to headlines
 
@@ -521,18 +527,156 @@ def level(audio):
     return audio
 
 
-def synthesize(script):
-    import numpy as np
-    from kokoro_onnx import Kokoro
+_backup = None
 
-    ensure_models()
-    voice = Kokoro(str(MODEL_DIR / "kokoro-v1.0.onnx"), str(MODEL_DIR / "voices-v1.0.bin"))
+
+def backup_voice():
+    global _backup
+    if _backup is None:
+        from kokoro_onnx import Kokoro
+
+        ensure_models()
+        _backup = Kokoro(str(MODEL_DIR / "kokoro-v1.0.onnx"), str(MODEL_DIR / "voices-v1.0.bin"))
+    return _backup
+
+
+def synthesize(script):
+    """Read text with the free backup voice (Kokoro)."""
+    import numpy as np
+
     rate, pieces = 24000, []
     for paragraph in [p for p in script.split("\n\n") if p.strip()]:
-        audio, rate = voice.create(paragraph, voice=VOICE, speed=SPEED, lang="en-us")
+        audio, rate = backup_voice().create(paragraph, voice=BACKUP_VOICE, speed=SPEED, lang="en-us")
         pieces += [audio, np.zeros(int(rate * 0.7), dtype=np.float32)]
     audio = np.concatenate(pieces) if pieces else np.zeros(rate, dtype=np.float32)
     return level(audio.astype(np.float32)), rate
+
+
+TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"]
+TTS_CHUNK_WORDS = 600             # about four minutes of audio per request
+
+
+def speech_chunks(script, limit=TTS_CHUNK_WORDS):
+    """Split the script at paragraph breaks into a few pieces for the voice to read."""
+    chunks, current = [], []
+    for paragraph in [p for p in script.split("\n\n") if p.strip()]:
+        if current and len(" ".join(current + [paragraph]).split()) > limit:
+            chunks.append("\n\n".join(current))
+            current = []
+        current.append(paragraph)
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
+def wav_audio(raw):
+    """Gemini sends a WAV file (or bare 16-bit PCM). Returns 24 kHz mono samples."""
+    import numpy as np
+
+    rate, channels = 24000, 1
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+        pos = 12
+        while pos + 8 <= len(raw):
+            kind, size = raw[pos:pos + 4], int.from_bytes(raw[pos + 4:pos + 8], "little")
+            if kind == b"fmt ":
+                channels = int.from_bytes(raw[pos + 10:pos + 12], "little") or 1
+                rate = int.from_bytes(raw[pos + 12:pos + 16], "little") or 24000
+            elif kind == b"data":
+                end = pos + 8 + size
+                raw = raw[pos + 8:end if end <= len(raw) else len(raw)]  # size can be a placeholder
+                break
+            pos += 8 + size + (size & 1)
+    samples = np.frombuffer(raw[:len(raw) // 2 * 2], dtype="<i2").astype(np.float32) / 32768
+    if channels > 1:
+        samples = samples[:len(samples) // channels * channels].reshape(-1, channels).mean(axis=1)
+    if rate != 24000 and samples.size:
+        steps = np.arange(0, len(samples), rate / 24000)
+        samples = np.interp(steps, np.arange(len(samples)), samples).astype(np.float32)
+    return samples
+
+
+def audio_parts(node):
+    """Every base64 audio clip in a Gemini reply, in order."""
+    if isinstance(node, dict):
+        if node.get("type") == "audio" and isinstance(node.get("data"), str):
+            yield node["data"]
+        for value in node.values():
+            yield from audio_parts(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from audio_parts(value)
+
+
+def gemini_speech(key, model, text):
+    """One part of the script read by Gemini's voice, or None if it didn't work."""
+    body = json.dumps({
+        "model": model,
+        "input": [{
+            "type": "user_input",
+            "content": [{
+                "type": "text",
+                "text": re.sub(r"[<>]", " ", text),  # angle brackets are cues to the voice
+                "annotations": [{"type": "speech_metadata", "style": VOICE_STYLE}],
+            }],
+        }],
+        "response_format": {"type": "audio"},
+        "generation_config": {"speech_config": [{"voice": VOICE}]},
+    }).encode()
+    for wait in (0, 30, 90):
+        if wait:
+            log(f"  Trying the voice again in {wait} seconds...")
+            time.sleep(wait)
+        request = urllib.request.Request(f"{GEMINI_BASE}/interactions", data=body, headers={
+            "Content-Type": "application/json", "x-goog-api-key": key})
+        try:
+            with urllib.request.urlopen(request, timeout=240) as response:
+                data = json.load(response)
+        except urllib.error.HTTPError as err:
+            detail = " ".join(err.read().decode(errors="replace").split())[:300]
+            log(f"  Voice {model}: HTTP {err.code} {detail}")
+            if err.code == 429 or err.code >= 500:
+                continue
+            return None
+        except Exception as err:
+            log(f"  Voice {model}: {err}")
+            continue
+        clips = list(audio_parts(data))
+        if not clips:
+            log(f"  Voice {model}: no audio in the reply {json.dumps(data)[:200]}")
+            return None
+        audio = wav_audio(base64.b64decode(clips[-1]))
+        if len(audio) / 24000 < len(text.split()) / 2.6 * 0.6:  # well under 150 words a minute
+            log(f"  Voice {model}: the audio came back cut short")
+            return None
+        return audio
+    return None
+
+
+def record(script):
+    """Read the script with Gemini's voice. The backup voice covers anything it can't."""
+    import numpy as np
+
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    chunks = speech_chunks(script)
+    pieces, use_gemini, backup_parts = [], bool(key), 0
+    for number, chunk in enumerate(chunks, 1):
+        audio = None
+        if use_gemini:
+            if number > 1:
+                time.sleep(20)  # stays under the free tier's per-minute limit
+            for model in TTS_MODELS:
+                audio = gemini_speech(key, model, chunk)
+                if audio is not None:
+                    break
+            if audio is None:
+                use_gemini = False
+                log("Gemini's voice isn't available, so the backup voice reads the rest.")
+        if audio is None:
+            audio, _ = synthesize(spoken_form(chunk))
+            backup_parts += 1
+        pieces += [audio, np.zeros(int(24000 * 0.6), dtype=np.float32)]
+    log(f"Recorded {len(chunks)} parts, {len(chunks) - backup_parts} with Gemini voice {VOICE}")
+    return level(np.concatenate(pieces).astype(np.float32)), 24000
 
 
 def to_mp3(audio, rate):
@@ -735,7 +879,7 @@ def main():
         raw = write_script(build_packet(now, report)) or basic_script(now, report)
     notes = strip_markup(raw)
     log("Recording...")
-    audio, rate = synthesize(spoken_form(notes))
+    audio, rate = record(notes)
     mp3 = to_mp3(audio, rate)
     seconds = len(audio) / rate
     base = publish(Path(args.site), now, mp3, seconds, notes)
