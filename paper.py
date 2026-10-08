@@ -32,9 +32,9 @@ VOICE = "af_heart"                # male option: "am_michael"
 SPEED = 1.0                       # 1.1 reads a little faster
 KEEP_EPISODES = 7                 # older episodes get deleted
 EPISODE_WORDS = 1350              # length target; the voice reads about 150 words a minute
-GEMINI_MODELS = [                 # tried in order until one works on the free tier
-    "gemini-flash-latest", "gemini-2.5-flash",
-    "gemini-flash-lite-latest", "gemini-2.5-flash-lite",
+GEMINI_MODELS = [                 # tried in order; newer Flash models get added automatically
+    "gemini-flash-latest", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+    "gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
 ]
 
 
@@ -338,8 +338,31 @@ def build_packet(now, report):
     return "\n".join(lines)
 
 
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models"
+BUSY_WAITS = (2, 5, 10)           # minutes to wait before trying again when Gemini is busy
+GEMINI_DEADLINE = 25 * 60         # seconds to keep trying before falling back to headlines
+
+
+def gemini_models(key):
+    """The models from SETTINGS, plus any other current Flash models Google lists."""
+    models = list(GEMINI_MODELS)
+    try:
+        listing = json.loads(fetch(f"{GEMINI_API}?pageSize=1000", {"x-goog-api-key": key}))
+    except Exception as err:
+        log(f"  Couldn't list Gemini models ({err})")
+        return models
+    found = []
+    for entry in listing.get("models", []):
+        match = re.fullmatch(r"models/(gemini-(\d+)(?:\.(\d+))?-flash(-lite)?)", entry.get("name", ""))
+        if match and "generateContent" in entry.get("supportedGenerationMethods", []):
+            name, major, minor, lite = match.groups()
+            found.append((bool(lite), -int(major), -int(minor or 0), name))
+    models += [name for *_, name in sorted(found) if name not in models]
+    return models[:10]
+
+
 def ask_gemini(key, model, prompt):
-    """One request to one model. Returns the script text, or None if it didn't work."""
+    """One request to one model. Returns (text, worth trying again later)."""
     body = json.dumps({
         "systemInstruction": {"parts": [{"text": HOST_BRIEF}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -348,34 +371,26 @@ def ask_gemini(key, model, prompt):
             "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
             "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")],
     }).encode()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    for attempt in (1, 2):
-        request = urllib.request.Request(url, data=body, headers={
-            "Content-Type": "application/json", "x-goog-api-key": key})
-        try:
-            with urllib.request.urlopen(request, timeout=300) as response:
-                data = json.load(response)
-        except urllib.error.HTTPError as err:
-            detail = err.read().decode(errors="replace")[:200].replace("\n", " ")
-            log(f"  Gemini {model}: HTTP {err.code} {detail}")
-            if err.code in (500, 503) and attempt == 1:
-                time.sleep(20)
-                continue
-            return None
-        except Exception as err:
-            log(f"  Gemini {model}: {err}")
-            if attempt == 1:
-                time.sleep(10)
-                continue
-            return None
-        candidate = (data.get("candidates") or [{}])[0]
-        parts = candidate.get("content", {}).get("parts", [])
-        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-        if len(text.split()) >= 150:
-            return text
-        log(f"  Gemini {model}: unusable reply (finish reason {candidate.get('finishReason')})")
-        return None
-    return None
+    request = urllib.request.Request(f"{GEMINI_API}/{model}:generateContent", data=body, headers={
+        "Content-Type": "application/json", "x-goog-api-key": key})
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as err:
+        detail = " ".join(err.read().decode(errors="replace").split())[:300]
+        log(f"  Gemini {model}: HTTP {err.code} {detail}")
+        return None, err.code == 429 or err.code >= 500  # busy or rate-limited
+    except Exception as err:
+        log(f"  Gemini {model}: {err}")
+        return None, True
+    candidate = (data.get("candidates") or [{}])[0]
+    parts = candidate.get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    if len(text.split()) >= 150:
+        return text, False
+    reason = candidate.get("finishReason") or (data.get("promptFeedback") or {}).get("blockReason")
+    log(f"  Gemini {model}: unusable reply ({reason})")
+    return None, False
 
 
 def write_script(packet):
@@ -383,28 +398,48 @@ def write_script(packet):
     if not key:
         log("No GEMINI_API_KEY secret found, so using the basic headline read.")
         return None
-    for model in GEMINI_MODELS:
-        text = ask_gemini(key, model, packet)
-        if not text:
-            continue
-        words = len(text.split())
-        log(f"Script written by {model}: {words} words")
-        if words < SHORT_WORDS:
-            log("  That runs short, so asking for a fuller version...")
-            fuller = ask_gemini(key, model, (
-                f"{packet}\n\n---\n\nHere is a draft script built from the items above. It's only "
-                f"{words} words, so it runs short. Rewrite it at about {EPISODE_WORDS:,} words by "
-                "covering more of the stories above and using more of the detail in their summaries. "
-                "Every rule still applies: only facts from the items, the same lineup and order, "
-                "and end with exactly: That's the paper.\n\nDRAFT\n" + text))
-            if fuller and words < len(fuller.split()) <= MAX_WORDS + 100:
-                text = fuller
-                log(f"  Fuller version: {len(text.split())} words")
-            else:
-                log("  Kept the first draft")
-        return text
+    models = gemini_models(key)
+    give_up = time.monotonic() + GEMINI_DEADLINE
+    for wait in (0, *BUSY_WAITS):
+        if wait:
+            if time.monotonic() + wait * 60 > give_up:
+                break
+            log(f"Gemini is busy, so trying again in {wait} minutes...")
+            time.sleep(wait * 60)
+        busy = []
+        for model in models:
+            if time.monotonic() > give_up:
+                break
+            text, retry = ask_gemini(key, model, packet)
+            if text:
+                log(f"Script written by {model}: {len(text.split())} words")
+                return fill_out(key, model, packet, text)
+            if retry:
+                busy.append(model)
+        if not busy:
+            break
+        models = busy  # models that are gone or refused don't get asked again
     log("Gemini wasn't available, so using the basic headline read.")
     return None
+
+
+def fill_out(key, model, packet, text):
+    """Give a draft that runs short one rewrite to bring it up to length."""
+    words = len(text.split())
+    if words >= SHORT_WORDS:
+        return text
+    log("  That runs short, so asking for a fuller version...")
+    fuller, _ = ask_gemini(key, model, (
+        f"{packet}\n\n---\n\nHere is a draft script built from the items above. It's only "
+        f"{words} words, so it runs short. Rewrite it at about {EPISODE_WORDS:,} words by "
+        "covering more of the stories above and using more of the detail in their summaries. "
+        "Every rule still applies: only facts from the items, the same lineup and order, "
+        "and end with exactly: That's the paper.\n\nDRAFT\n" + text))
+    if fuller and words < len(fuller.split()) <= MAX_WORDS + 100:
+        log(f"  Fuller version: {len(fuller.split())} words")
+        return fuller
+    log("  Kept the first draft")
+    return text
 
 
 def basic_script(now, report):
