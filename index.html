@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>The Morning Paper</title>
+<link rel="alternate" type="application/rss+xml" title="The Morning Paper" href="https://jspencejayhawks-eng.github.io/morning-paper/feed.xml">
+<link rel="icon" href="cover.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#16202c;--ink:#e7ebf0;--muted:#93a0b3;--amber:#f2b84b;--on-amber:#16202c;--rule:#273445;color-scheme:dark light}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6f9;--ink:#16202c;--muted:#566273;--amber:#8a5700;--on-amber:#fff;--rule:#d8dee6}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:1.0625rem/1.55 "Atkinson Hyperlegible",system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:34rem;margin:0 auto;padding:3rem 1.25rem 4rem}
+h1{font-size:1rem;color:var(--muted);margin:0 0 1.25rem}
+.date{font-size:clamp(2.4rem,10.5vw,4rem);line-height:1.02;font-weight:700;margin:0;padding-bottom:1.25rem;border-bottom:3px solid var(--amber)}
+audio{display:block;width:100%;margin-top:1.25rem}
+.len{color:var(--muted);font-size:.95rem;margin:.4rem 0 0}
+h2{font-size:1.125rem;margin:3rem 0 .75rem}
+.feed{display:flex;gap:.5rem}
+.feed input{flex:1;min-width:0;font:inherit;font-size:.95rem;padding:.7rem .8rem;border:1px solid var(--rule);border-radius:.5rem;background:transparent;color:var(--ink)}
+button{font:inherit;font-weight:700;padding:.7rem 1rem;border:0;border-radius:.5rem;background:var(--amber);color:var(--on-amber);cursor:pointer}
+button:focus-visible,input:focus-visible{outline:3px solid var(--amber);outline-offset:2px}
+.hint{color:var(--muted);font-size:.95rem;margin:.6rem 0 0}
+ul{list-style:none;margin:0;padding:0}
+li{display:grid;grid-template-columns:1fr auto;gap:.25rem 1rem;padding:1rem 0;border-top:1px solid var(--rule)}
+li .len{margin:0}
+li audio{grid-column:1/-1;margin-top:.5rem}
+</style>
+</head>
+<body>
+<main>
+<h1>The Morning Paper</h1>
+<p class="date">Saturday,<br>October 10</p>
+<audio controls preload="none" src="episodes/2026-10-10.mp3"></audio>
+<p class="len">9 min</p>
+<h2>Add it to your podcast app</h2>
+<div class="feed"><input id="feed" value="https://jspencejayhawks-eng.github.io/morning-paper/feed.xml" readonly aria-label="Podcast feed link"><button id="copy" type="button">Copy link</button></div>
+<p class="hint">In Apple Podcasts, choose Follow a Show by URL and paste this link.</p>
+<h2>Earlier</h2>
+<ul>
+<li><span>Friday, October 9</span><span class="len">9 min</span><audio controls preload="none" src="episodes/2026-10-09.mp3"></audio></li>
+<li><span>Thursday, October 8</span><span class="len">7 min</span><audio controls preload="none" src="episodes/2026-10-08.mp3"></audio></li>
+</ul>
+</main>
+<script>
+document.getElementById("copy").addEventListener("click", async (e) => {
+  const box = document.getElementById("feed");
+  try { await navigator.clipboard.writeText(box.value); } catch { box.select(); document.execCommand("copy"); }
+  e.target.textContent = "Copied";
+  setTimeout(() => (e.target.textContent = "Copy link"), 2000);
+});
+</script>
+</body>
+</html>
